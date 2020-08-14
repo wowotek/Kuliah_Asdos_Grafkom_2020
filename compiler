@@ -1,0 +1,67 @@
+#!/usr/bin/python3
+import os, sys
+
+DEBUG = True
+BUILD_FOLDER = "build"
+
+def debug(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+def info(*args, **kwargs):
+    print(*args, **kwargs)
+
+args = sys.argv
+n_args = args.copy()
+c = 0
+for arg in args:
+    if arg == "--build-folder":
+        info(f"[CONFIG] Switching Build folder from '{BUILD_FOLDER}' to { args[c+1] }")
+        BUILD_FOLDER = args[c+1]
+        n_args.remove("--build-folder")
+        n_args.remove(BUILD_FOLDER)
+    if arg in ["--debug", "--verbose", "-v"]:
+        info("[CONFIG] Verbosity turned on")
+        try:
+            n_args.remove("--debug")
+            n_args.remove("--verbose")
+            n_args.remove("-v")
+        except:
+            ...
+        DEBUG = True
+    c += 1
+
+if n_args[0] in ["py", "py3", "python", "python3"] and n_args[0] != "compiler":
+    debug(f"[SYSTEM] Popping {n_args[0]}")
+    n_args.pop(0)
+    debug(f"[SYSTEM] Popping {n_args[0]}")
+    n_args.pop(0)
+else:
+    debug(f"[SYSTEM] Popping {n_args[0]}")
+    n_args.pop(0)
+
+folders = [i.replace("/", "") for i in n_args]
+
+BUILD_FOLDER = BUILD_FOLDER.replace("/", "")
+info(f"[PROCESS][COMPILATION][PREPARATION] preparing build folder : {BUILD_FOLDER}")
+debug(f"[PROCESS][COMPILATION][PREPARATION] removing {BUILD_FOLDER}")
+os.system(f"rm -rf {BUILD_FOLDER}")
+debug(f"[PROCESS][COMPILATION][PREPARATION] creating {BUILD_FOLDER}")
+os.system(f"mkdir {BUILD_FOLDER}")
+for folder in folders:
+    debug(f"[PROCESS][COMPILATION][PREPARATION] preparing {folder}")
+    debug(f"[PROCESS][COMPILATION][PREPARATION] removing {BUILD_FOLDER}/{folder}")
+    os.system(f"rm -rf {BUILD_FOLDER}/{folder}")
+    debug(f"[PROCESS][COMPILATION][PREPARATION] creating {BUILD_FOLDER}/{folder}")
+    os.system(f"mkdir {BUILD_FOLDER}/{folder}")
+
+for folder in folders:
+    for file in [f.replace(".cc", "") for f in os.listdir(f"target/{folder}")]:
+        info(f"[PROCESS][COMPILATION] Compiling {folder}/{file}.cc")
+        compilation_arguments = f"g++ target/{folder}/{file}.cc -lGL -lGLU -lglut -o {BUILD_FOLDER}/{folder}/{file}.o"
+
+        status = os.system(compilation_arguments)
+        if status == 0:
+            info(f"[PROCESS][COMPILATION] Success Compiled to {BUILD_FOLDER}/{folder}/{file}")
+        else:
+            info("[PROCESS][COMPILATION] Failed")

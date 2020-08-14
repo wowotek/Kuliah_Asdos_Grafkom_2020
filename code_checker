@@ -1,0 +1,561 @@
+#!/usr/bin/python3
+import os
+import sys
+import subprocess
+import requests
+import glob
+import itertools
+import csv
+import re
+import json
+import itertools
+import nltk
+import base64
+from math import floor
+from difflib import SequenceMatcher
+from nltk.metrics.distance import edit_distance as editDistance
+from nltk.stem.lancaster import LancasterStemmer
+from nltk.util import ngrams
+from string import punctuation
+
+global DEBUG
+DEBUG = False
+
+def debug(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+def info(*args, **kwargs):
+    print(*args, **kwargs)
+
+#######  MATCHER  #######
+
+class Text:
+    def __init__(self, raw_text, label, removeStopwords=True):
+        if type(raw_text) == list:
+            # JSTOR critical works come in lists, where each item represents a page.
+            self.text = ' \n '.join(raw_text)
+        else:
+            self.text = raw_text
+        self.label = label
+        self.preprocess(self.text)
+        self.tokens = self.getTokens(removeStopwords)
+        self.trigrams = self.ngrams(3)
+
+    def preprocess(self, text):
+        """ Heals hyphenated words, and maybe other things. """
+        self.text = re.sub(r'([A-Za-z])- ([a-z])', r'\1\2', self.text)
+
+    def getTokens(self, removeStopwords=True):
+        """ Tokenizes the text, breaking it up into words, removing punctuation. """
+        tokenizer = nltk.RegexpTokenizer('[a-zA-Z]\w+\'?\w*') # A custom regex tokenizer.
+        spans = list(tokenizer.span_tokenize(self.text))
+        # Take note of how many spans there are in the text
+        self.length = spans[-1][-1]
+        tokens = tokenizer.tokenize(self.text)
+        tokens = [ token.lower() for token in tokens ] # make them lowercase
+        stemmer = LancasterStemmer()
+        tokens = [ stemmer.stem(token) for token in tokens ]
+        if not removeStopwords:
+            self.spans = spans
+            return tokens
+        tokenSpans = list(zip(tokens, spans)) # zip it up
+        stopwords = nltk.corpus.stopwords.words('english') # get stopwords
+        tokenSpans = [ token for token in tokenSpans if token[0] not in stopwords ] # remove stopwords from zip
+        self.spans = [ x[1] for x in tokenSpans ] # unzip; get spans
+        return [ x[0] for x in tokenSpans ] # unzip; get tokens
+
+    def ngrams(self, n):
+        """ Returns ngrams for the text."""
+        return list(ngrams(self.tokens, n))
+
+
+class ExtendedMatch():
+    """
+    Data structure container for a fancy version of a difflib-style
+    Match object. The difflib Match class won't work for extended
+    matches, since it only has the properties `a` (start location in
+    text A), `b` (start location in text B), and size. Since our fancy
+    new matches have different sizes in our different texts, we'll need
+    two size attributes.
+    """
+    def __init__(self, a, b, sizeA, sizeB):
+        self.a = a
+        self.b = b
+        self.sizeA = sizeA
+        self.sizeB = sizeB
+        # Whether this is actually two matches that have been fused into one.
+        self.healed = False
+        # Whether this match has been extended from its original boundaries.
+        self.extendedBackwards = 0
+        self.extendedForwards = 0
+
+    def __repr__(self):
+        out = "a: %s, b: %s, size a: %s, size b: %s" %                 (self.a, self.b, self.sizeA, self.sizeB)
+        if self.extendedBackwards:
+            out += ", extended backwards x%s" % self.extendedBackwards
+        if self.extendedForwards:
+            out += ", extended forwards x%s" % self.extendedForwards
+        if self.healed:
+            out += ", healed"
+        return out
+
+class Matcher():
+    """
+    Does the text matching.
+    """
+    def __init__(self, textObjA, textObjB, threshold=3, cutoff=5, ngramSize=3, removeStopwords=True):
+
+        """
+        Takes as input two Text() objects, and matches between them.
+        """
+        self.threshold = threshold
+        self.ngramSize = ngramSize
+
+        self.textA = textObjA
+        self.textB = textObjB
+
+        self.textAgrams = self.textA.ngrams(ngramSize)
+        self.textBgrams = self.textB.ngrams(ngramSize)
+
+        self.locationsA = []
+        self.locationsB = []
+
+        self.initial_matches = self.get_initial_matches()
+        self.healed_matches = self.heal_neighboring_matches()
+
+        self.extended_matches = self.extend_matches()
+
+        # Prune matches
+        self.extended_matches = [match for match in self.extended_matches
+                if min(match.sizeA, match.sizeB) >= cutoff]
+
+        self.numMatches = len(self.extended_matches)
+
+    def get_initial_matches(self):
+        """
+        This does the main work of finding matching n-gram sequences between
+        the texts.
+        """
+        sequence = SequenceMatcher(None,self.textAgrams,self.textBgrams)
+        matchingBlocks = sequence.get_matching_blocks()
+
+        # Only return the matching sequences that are higher than the
+        # threshold given by the user.
+        highMatchingBlocks = [match for match in matchingBlocks if match.size > self.threshold]
+
+        numBlocks = len(highMatchingBlocks)
+
+        if numBlocks > 0:
+            debug('%s total matches found.' % numBlocks, flush=True)
+
+        return highMatchingBlocks
+
+    def getContext(self, text, start, length, context):
+        match = self.getTokensText(text, start, length)
+        before = self.getTokensText(text, start-context, context)
+        after = self.getTokensText(text, start+length, context)
+        out = " ".join([before, match, after])
+        out = out.replace('\n', ' ') # Replace newlines with spaces.
+        out = re.sub('\s+', ' ', out)
+        return out
+
+    def getTokensText(self, text, start, length):
+        """ Looks up the passage in the original text, using its spans. """
+        matchTokens = text.tokens[start:start+length]
+        spans = text.spans[start:start+length]
+        if len(spans) == 0:
+            # Don't try to get text or context beyond the end of a text.
+            passage = ""
+        else:
+            passage = text.text[spans[0][0]:spans[-1][-1]]
+        return passage
+
+    def getLocations(self, text, start, length, asPercentages=False):
+        """ Gets the numeric locations of the match. """
+        spans = text.spans[start:start+length]
+        if asPercentages:
+            locations = (spans[0][0]/text.length, spans[-1][-1]/text.length)
+        else:
+            try:
+                locations = (spans[0][0], spans[-1][-1])
+            except IndexError:
+                return None
+        return locations
+
+    def getMatch(self, match, context=5):
+        textA, textB = self.textA, self.textB
+        lengthA = match.sizeA + self.ngramSize -1 # offset according to nGram size
+        lengthB = match.sizeB + self.ngramSize -1 # offset according to nGram size
+        wordsA = self.getContext(textA, match.a, lengthA, context)
+        wordsB = self.getContext(textB, match.b, lengthB, context)
+        spansA = self.getLocations(textA, match.a, lengthA)
+        spansB = self.getLocations(textB, match.b, lengthB)
+        if spansA is not None and spansB is not None:
+            self.locationsA.append(spansA)
+            self.locationsB.append(spansB)
+            line1 = ('%s: %s %s' % (textA.label, spansA, wordsA) )
+            line2 = ('%s: %s %s' % (textB.label, spansB, wordsB) )
+            out = line1 + '\n' + line2
+            return out
+
+    def heal_neighboring_matches(self, minDistance=8):
+        healedMatches = []
+        ignoreNext = False
+        matches = self.initial_matches.copy()
+        # Handle only one match.
+        if len(matches) == 1:
+            match = matches[0]
+            sizeA, sizeB = match.size, match.size
+            match = ExtendedMatch(match.a, match.b, sizeA, sizeB)
+            healedMatches.append(match)
+            return healedMatches
+        for i, match in enumerate(matches):
+            if i+1 > len(matches)-1:
+                break
+            nextMatch = matches[i+1]
+            if ignoreNext:
+                ignoreNext = False
+                continue
+            else:
+                if ( nextMatch.a - (match.a + match.size) ) < minDistance:
+                    sizeA = (nextMatch.a + nextMatch.size) - match.a
+                    sizeB = (nextMatch.b + nextMatch.size) - match.b
+                    healed = ExtendedMatch(match.a, match.b, sizeA, sizeB)
+                    healed.healed = True
+                    healedMatches.append(healed)
+                    ignoreNext = True
+                else:
+                    sizeA, sizeB = match.size, match.size
+                    match = ExtendedMatch(match.a, match.b, sizeA, sizeB)
+                    healedMatches.append(match)
+        return healedMatches
+
+    def edit_ratio(self, wordA, wordB):
+        """ Computes the number of edits required to transform one
+        (stemmed already, probably) word into another word, and
+        adjusts for the average number of letters in each.
+        Examples:
+        color, colour: 0.1818181818
+        theater, theatre: 0.2857
+        day, today: 0.5
+        foobar, foo56bar: 0.2857
+        """
+        distance = editDistance(wordA, wordB)
+        averageLength = (len(wordA) + len(wordB))/2
+        return distance/averageLength
+
+    def extend_matches(self, cutoff=0.4):
+        extended = False
+        for match in self.healed_matches:
+            # Look one word before.
+            wordA = self.textAgrams[(match.a - 1)][0]
+            wordB = self.textBgrams[(match.b - 1)][0]
+            if self.edit_ratio(wordA, wordB) < cutoff:
+                debug('Extending match backwards with words: %s %s' %
+                     (wordA, wordB) )
+                match.a -= 1
+                match.b -= 1
+                match.sizeA += 1
+                match.sizeB += 1
+                match.extendedBackwards += 1
+                extended = True
+            # Look one word after.
+            idxA = match.a + match.sizeA + 1
+            idxB = match.b + match.sizeB + 1
+            if idxA > len(self.textAgrams)-1 or idxB > len(self.textBgrams)-1:
+                # We've gone too far, and we're actually at the end of the text.
+                continue
+            wordA = self.textAgrams[idxA][-1]
+            wordB = self.textBgrams[idxB][-1]
+            if self.edit_ratio(wordA, wordB) < cutoff:
+                debug('Extending match forwards with words: %s %s' %
+                     (wordA, wordB) )
+                match.sizeA += 1
+                match.sizeB += 1
+                match.extendedForwards += 1
+                extended = True
+
+        if extended:
+            # If we've gone through the whole list and there's nothing
+            # left to extend, then stop. Otherwise do this again.
+            self.extend_matches()
+
+        return self.healed_matches
+
+    def match(self):
+        """ Gets and prints all matches. """
+
+        for num, match in enumerate(self.extended_matches):
+            # print('match: ', match)
+            out = self.getMatch(match)
+            debug('\n')
+            debug('match %s:' % (num+1), flush=True)
+            debug(out, flush=True)
+
+        return self.numMatches, self.locationsA, self.locationsB
+#######  MATCHER END #######
+
+def getFiles(path): 
+    if os.path.isfile(path): 
+        return [path]
+    elif os.path.isdir(path): 
+        return glob.glob(path + "/**/*.cc", recursive=True)
+    else: 
+        raise TypeError("The path %s doesn't appear to be a file or directory" % path) 
+
+def createLog(logfile, columnLabels):
+    header = ','.join(columnLabels) + '\n'
+    with open(logfile, 'w') as f: 
+        f.write(header) 
+        f.close
+
+def checkLog(logfile, textpair):
+    pairs = []
+    debug('[FUNC][CHECKLOG] Looking in the log for textpair:' % textpair)
+    if not os.path.isfile(logfile): 
+        debug('[FUNC][CHECKLOG] No log file found.')
+        return None
+
+    with open(logfile, newline='') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            pairs.append([row[0], row[1]])
+    return textpair in pairs
+
+def comparator(text1: str, text2: str, threshold: int = 3, cutoff: int =5, ngrams: int = 3, logfile: str = "copy_check.csv", stops: bool = False):
+    #Determine whether the given path is a file or directory. 
+
+    texts1 = getFiles(text1)
+    texts2 = getFiles(text2) 
+
+    debug('[COMPARATOR] Comparing this/these text(s): %s' % str(texts1))
+    debug('[COMPARATOR] with this/these text(s): %s' % str(texts2))
+
+    pairs = list(itertools.product(texts1, texts2))
+
+    numPairs = len(pairs) 
+
+    debug('[COMPARATOR] Comparing %s pairs.' % numPairs)
+    debug('[COMPARATOR] Loading files into memory.')
+
+    texts = {}
+    prevTextObjs = {}
+    for filename in texts1+texts2: 
+        with open(filename, errors="ignore") as f: 
+            text = f.read() 
+        if filename not in texts: 
+            texts[filename] = text
+
+    debug('[COMPARATOR] Loading complete.')
+
+    for index, pair in enumerate(pairs): 
+        timeStart = os.times().elapsed
+        debug('[COMPARATOR] Now comparing pair %s of %s.' % (index+1, numPairs))
+        debug('[COMPARATOR] Comparing %s with %s.' % (pair[0], pair[1]))
+
+        # Make sure we haven't already done this pair. 
+        inLog = checkLog(logfile, [pair[0], pair[1]])
+
+        if inLog is None: 
+            # This means that there isn't a log file. Let's set one up.
+            # Set up columns and their labels. 
+            columnLabels = ['Text A', 'Text B', 'Num Matches', 'Text A Length', 'Text B Length', 'Locations in A', 'Locations in B']
+            debug('[COMPARATOR] No log file found. Setting one up.')
+            createLog(logfile, columnLabels)
+            
+        if inLog: 
+            debug('[COMPARATOR] This pair is already in the log. Skipping.')
+            continue
+
+        debug('[COMPARATOR] Processing texts.')
+
+        filenameA, filenameB = pair[0], pair[1]
+        textA, textB = texts[filenameA], texts[filenameB]
+
+        # Put this in a dictionary so we don't have to process a file twice.
+        for filename in [filenameA, filenameB]: 
+            if filename not in prevTextObjs: 
+                debug('[COMPARATOR] Processing text: %s' % filename)
+                prevTextObjs[filename] = Text(texts[filename], filename)
+
+        # Just more convenient naming. 
+        textObjA = prevTextObjs[filenameA]
+        textObjB = prevTextObjs[filenameB]
+
+        # Reset the table of previous text objects, so we don't overload memory. 
+        # This means we'll only remember the previous two texts. 
+        prevTextObjs = {filenameA: textObjA, filenameB: textObjB}
+
+        # Do the matching. 
+        myMatch = Matcher(textObjA, textObjB, threshold=threshold, cutoff=cutoff, ngramSize=ngrams, removeStopwords=stops)
+        myMatch.match()
+
+        timeEnd = os.times().elapsed
+        timeElapsed = timeEnd-timeStart
+        debug('[COMPARATOR] Matching completed in %s seconds.' % timeElapsed)
+
+        # Write to the log, but only if a match is found.
+        if myMatch.numMatches > 0: 
+            logItems = [pair[0], pair[1], myMatch.numMatches, myMatch.textA.length, myMatch.textB.length, str(myMatch.locationsA), str(myMatch.locationsB)]
+            debug('[COMPARATOR] Logging items: %s' % str(logItems))
+            line = ','.join(['"%s"' % item for item in logItems]) + '\n'
+            f = open(logfile, 'a')
+            f.write(line)
+            f.close()
+
+def main():
+    COPY_CHECK = False
+    COMPARE = False
+    COPY_CHECK_FOLDER = "copy_check"
+
+    args = sys.argv
+    n_args = args.copy()
+    c = 0
+    for arg in args:
+        if arg in ["--check-only"]:
+            COPY_CHECK = True
+            COMPARE = False
+            try:
+                n_args.remove("--check-only")
+                n_args.remove("--compare-only")
+            except:
+                ...
+        if arg in ["--compare-only"]:
+            COPY_CHECK = False
+            COMPARE = True
+            try:
+                n_args.remove("--check-only")
+                n_args.remove("--compare-only")
+            except:
+                ...
+        if arg in ["--check"]:
+            COPY_CHECK = True
+            n_args.remove("--check")
+        if arg in ["--compare"]:
+            COMPARE = True
+            n_args.remove("--compare")
+        if arg in ["--check-folder"]:
+            COPY_CHECK = True
+            COPY_CHECK_FOLDER = n_args[c+1].replace("/", "")
+            n_args.remove("--check-folder")
+            n_args.remove(n_args[c+1])
+        if arg in ["--debug", "--verbose", "-v"]:
+            info("[CONFIG] Verbosity turned on")
+            global DEBUG
+            DEBUG = True
+            try:
+                n_args.remove("--debug")
+                n_args.remove("--verbose")
+                n_args.remove("-v")
+            except:
+                ...
+        c += 1
+
+    if n_args[0] in ["py", "py3", "python", "python3"] and n_args[0] != "compiler":
+        debug(f"[SYSTEM] Popping {n_args[0]}")
+        n_args.pop(0)
+        debug(f"[SYSTEM] Popping {n_args[0]}")
+        n_args.pop(0)
+    else:
+        debug(f"[SYSTEM] Popping {n_args[0]}")
+        n_args.pop(0)
+
+    folders = [i.replace("/", "") for i in n_args]
+
+    if COPY_CHECK:
+        COPY_CHECK_FOLDER = COPY_CHECK_FOLDER.replace("/", "")
+        info(f"[PROCESS][COPY_CHECK][PREPARATION] preparing copy_check folder : {COPY_CHECK_FOLDER}")
+        debug(f"[PROCESS][COPY_CHECK][PREPARATION] removing {COPY_CHECK_FOLDER}")
+        os.system(f"rm -rf {COPY_CHECK_FOLDER}")
+        debug(f"[PROCESS][COPY_CHECK][PREPARATION] creating {COPY_CHECK_FOLDER}")
+        os.system(f"mkdir {COPY_CHECK_FOLDER}")
+
+    compare_index = 1
+    data = dict()
+    for folder in folders:
+        if COPY_CHECK:
+            files = os.listdir(f"target/{folder}")
+            files.sort()
+            for i in range(len(files)):
+                for j in range(i, len(files)):
+                    if i == j:
+                        continue
+                    fi = files[i]
+                    fj = files[j]
+                    info(f"[COMPARATOR] Comparing {fi} with {fj}")
+                    try:
+                        comparator(f"target/{folder}/{fi}", f"target/{folder}/{fj}", logfile=f"{COPY_CHECK_FOLDER}/{folder}.csv")
+                    except: ...
+        if COMPARE:
+            files = os.listdir(f"target/{folder}")
+            files.sort()
+            for i in range(len(files)):
+                for j in range(i, len(files)):
+                    if i == j:
+                        continue
+                    fi = files[i]
+                    fj = files[j]
+                    data[compare_index] = {
+                        "name": f"{fi} <> {fj}",
+                        "folder": folder,
+                        "fi": fi,
+                        "fj": fj,
+                        "checked": False,
+                        "matched": 0,
+                        "diff_length": 0
+                    }
+                    compare_index += 1
+    if COMPARE:
+        checked = 0
+        remaining = 0
+        page_now = 1
+        page_of = floor(len(data) / 10)
+        while True:
+            for i in data:
+                if data[i]["checked"]:
+                    checked += 1
+                else:
+                    remaining += 1
+            print("-=-=-=-=-=-= Comparison Menu =-=-=-=-=-=-")
+            print(f" | - Total: {len(data)}")
+            print(f" | - Checked: {checked}")
+            print(f" | - Remaining: {remaining}\n")
+            print("Select Number / Action:")
+            print(f"         Page {page_now} of {page_of}")
+            for i in range(10):
+                print(f"  {i+((page_now-1)*10)+1}. ", end="")
+                if data[i+((page_now-1)*10)+1]["checked"]:
+                    print("[\033[92mV\033[0m] ", end="")
+                else:
+                    print("[\033[91mX\033[0m] ", end="")
+                print(f"{data[i+((page_now-1)*10)+1]['name']}")
+            print(f"         Page {page_now} of {page_of}")
+            print("\n")
+            print("  [E] Exit")
+            print("  [<] Previous Page")
+            print("  [>] Next Page")
+            action = input("\nAction : ")
+            if action in ["E", "e", "<", ">"]:
+                if action in ["E", "e"]:
+                    exit()
+                elif action == "<":
+                    if page_now != 1:
+                        page_now -= 1
+                    else:
+                        print("Minimum Page")
+                elif action == ">":
+                    if page_now != page_of:
+                        page_now += 1
+                    else:
+                        print("Maximum Page")
+                else:
+                    print("Unknown Command")
+            else:
+                if action in "123456789":
+                    action = int(action)
+                else:
+                    print("Unknown Command")
+
+if __name__ == "__main__":
+    main()
